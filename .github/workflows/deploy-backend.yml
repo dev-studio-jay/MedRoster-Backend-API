@@ -1,8 +1,8 @@
 name: Deploy Backend to Vercel
 
+# Production deploys on push to main via Vercel Git (dashboard).
+# This workflow is a manual backup; it needs secrets.VERCEL_TOKEN.
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
 
 jobs:

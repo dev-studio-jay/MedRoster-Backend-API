@@ -22,15 +22,14 @@ Set in the Vercel project (Production / Preview / Development):
 - `ALLOWED_ORIGINS` — e.g. `https://medroster-frontend.vercel.app,http://localhost:3000`
 - `OPENAI_API_KEY` — optional; used to clean duty-roster Word extracts
 
-## GitHub Actions
+## Git → production
 
-Workflow: [`.github/workflows/deploy-backend.yml`](.github/workflows/deploy-backend.yml)
+Repo [`dev-studio-jay/MedRoster-Backend-API`](https://github.com/dev-studio-jay/MedRoster-Backend-API) is connected to Vercel project `medroster-backend`.
 
-Secrets required in the **backend** GitHub repo:
+- Push to **`main`** → production [https://medroster-backend.vercel.app](https://medroster-backend.vercel.app)
+- Other branches → preview deployments
 
-- `VERCEL_TOKEN`
-- `VERCEL_ORG_ID`
-- `VERCEL_PROJECT_ID`
+Optional GitHub Actions backup: [`.github/workflows/deploy-backend.yml`](.github/workflows/deploy-backend.yml) (`workflow_dispatch`). Needs `VERCEL_TOKEN` from [Vercel account tokens](https://vercel.com/account/tokens), plus `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID`.
 
 ## Local
 
