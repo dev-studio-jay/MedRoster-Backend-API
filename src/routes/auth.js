@@ -403,14 +403,24 @@ router.post('/upgrade-to-enterprise', requireAuth, async (req, res) => {
             const data = doc.data();
             if (!Array.isArray(data.staff)) continue;
             for (const s of data.staff) {
-                const emp = String(s.employeeId || '').trim().toLowerCase();
-                const lic = String(s.licenseNumber || '').trim().toLowerCase();
                 const name = `${s.firstName || ''} ${s.lastName || ''}`.trim().toLowerCase();
-                const key = emp ? `emp:${emp}` : lic ? `lic:${lic}` : `name:${name}`;
-                if (!name && !emp && !lic) continue;
+                const key = `name:${name}`;
+                if (!name) continue;
                 if (seenStaff.has(key)) continue;
                 seenStaff.add(key);
-                const { _id: _staffId, id: _legacyId, ...rest } = s;
+                const {
+                    _id: _staffId,
+                    id: _legacyId,
+                    employeeId: _e,
+                    ghanaCardNumber: _g,
+                    dateOfBirth: _d,
+                    address: _a,
+                    licenseType: _lt,
+                    licenseNumber: _ln,
+                    licenseExpiry: _le,
+                    emergencyContact: _ec,
+                    ...rest
+                } = s;
                 uniqueStaff.push({
                     ...rest,
                     hospitalId: hospitalRef.id,

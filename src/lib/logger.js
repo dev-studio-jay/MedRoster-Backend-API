@@ -31,8 +31,10 @@ export const logValidationFailure = (schedId, errors) =>
 export const logAutoGeneration = (schedId, staffCount, assignmentCount, durationMs) =>
     write('info', 'AUTO_GENERATION', `Auto-generated schedule ${schedId}`, { staffCount, assignmentCount, durationMs });
 
-export const logError = (category, message, err) =>
-    write('error', category, message, { error: err?.message, stack: err?.stack });
+export const logError = (category, message, err) => {
+    console.error(`[${category}] ${message}`, err?.code || '', err?.message || err);
+    write('error', category, message, { error: err?.message, code: err?.code, stack: err?.stack });
+};
 
 export const logInfo = (category, message, meta = {}) =>
     write('info', category, message, meta);

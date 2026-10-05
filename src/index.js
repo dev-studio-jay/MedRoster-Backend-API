@@ -20,8 +20,12 @@ import guestRoutes from './routes/guest.js';
 const app = express();
 
 // ── Security & parsing ───────────────────────────────────────────────────────
-app.use(helmet());
-app.use(express.json({ limit: '2mb' }));
+app.use(helmet({
+    // API is called from the Next.js origin; default same-origin CORP/COOP breaks that.
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+}));
+app.use(express.json({ limit: '8mb' }));
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')

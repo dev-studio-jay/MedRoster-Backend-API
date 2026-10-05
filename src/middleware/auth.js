@@ -1,5 +1,10 @@
 import { adminAuth, db } from '../config/firebase.js';
 import { ACCOUNT_TYPES, getTierLimits } from '../lib/tier-limits.js';
+import { logError } from '../lib/logger.js';
+
+function bearerToken(header) {
+    return header.slice(7).trim();
+}
 
 /** Verify Firebase ID token only (user doc may not exist yet). */
 export async function requireFirebaseUser(req, res, next) {
@@ -9,10 +14,10 @@ export async function requireFirebaseUser(req, res, next) {
     }
 
     try {
-        const decoded = await adminAuth.verifyIdToken(header.slice(7));
-        req.firebaseUser = decoded;
+        req.firebaseUser = await adminAuth.verifyIdToken(bearerToken(header));
         next();
     } catch (err) {
+        logError('AUTH', 'verifyIdToken failed', err);
         if (err.code === 'auth/id-token-expired') {
             return res.status(401).json({ error: 'Token expired — please sign in again' });
         }
@@ -26,14 +31,24 @@ export async function requireAuth(req, res, next) {
         return res.status(401).json({ error: 'Unauthorized — missing Bearer token' });
     }
 
+    let decoded;
     try {
-        const decoded = await adminAuth.verifyIdToken(header.slice(7));
+        decoded = await adminAuth.verifyIdToken(bearerToken(header));
+    } catch (err) {
+        logError('AUTH', 'verifyIdToken failed', err);
+        if (err.code === 'auth/id-token-expired') {
+            return res.status(401).json({ error: 'Token expired — please sign in again' });
+        }
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    try {
         const userSnap = await db.doc(`users/${decoded.uid}`).get();
         if (!userSnap.exists) {
             return res.status(401).json({ error: 'User account not found' });
         }
         const userData = userSnap.data();
-        if (!userData.isActive) {
+        if (userData.isActive === false) {
             return res.status(403).json({ error: 'Account is inactive' });
         }
         const accountType = userData.accountType
@@ -47,10 +62,8 @@ export async function requireAuth(req, res, next) {
         req.tierLimits = getTierLimits(accountType);
         next();
     } catch (err) {
-        if (err.code === 'auth/id-token-expired') {
-            return res.status(401).json({ error: 'Token expired — please sign in again' });
-        }
-        return res.status(401).json({ error: 'Invalid token' });
+        logError('AUTH', 'Failed to load user profile', err);
+        return res.status(500).json({ error: 'Could not load your account. Please try again.' });
     }
 }
 

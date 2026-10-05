@@ -1,22 +1,48 @@
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
-import { db, batchedDelete } from '../config/firebase.js';
+import { db, batchedDelete, batchedSet } from '../config/firebase.js';
 import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
 import { classifyStaffType } from '../lib/staff-utils.js';
 import { buildStaffCsvTemplate, mapCsvRowToStaff, parseCsv } from '../lib/staff-csv.js';
+import { categoryFromRank, expandRank, splitFullName } from '../lib/rank-abbr.js';
+import { parseDocxRoster } from '../lib/docx-roster.js';
+import { interpretRosterGrid, refineExtractWithOpenAI, stripInventedPii } from '../lib/roster-extract.js';
 import { getTierLimits } from '../lib/tier-limits.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router({ mergeParams: true });
 
+const STAFF_PII_KEYS = [
+    'ghanaCardNumber', 'employeeId', 'dateOfBirth', 'address',
+    'licenseType', 'licenseNumber', 'licenseExpiry', 'emergencyContact',
+];
+
+function omitPii(data) {
+    const out = { ...data };
+    for (const k of STAFF_PII_KEYS) delete out[k];
+    return out;
+}
+
 function serializeStaff(id, data, wardsMap) {
     const wardId = data.wardId || (data.departmentId && wardsMap ? wardsMap.get(data.departmentId) : '') || '';
+    const slim = omitPii(data);
     return {
         _id: id,
-        ...data,
+        ...slim,
         wardId,
         fullName: `${data.firstName || ''} ${data.lastName || ''}`.trim(),
     };
+}
+
+function decodeUploadedFile(body) {
+    const raw = body.fileBase64 || body.csvText;
+    if (!raw) return null;
+    const b64 = String(raw).includes(',') ? String(raw).split(',').pop() : String(raw);
+    try {
+        return Buffer.from(b64, body.csvText && !body.fileBase64 ? 'utf8' : 'base64');
+    } catch {
+        return null;
+    }
 }
 
 // GET /hospitals/:id/staff?departmentId=...&wardId=...
@@ -66,12 +92,39 @@ router.get('/template/download', requireAuth, requireHospital, async (req, res) 
 router.post('/import', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId } = req.params;
-        const { csvText, fileBase64, defaultDepartmentId, defaultWardId } = req.body;
-        let text = csvText;
-        if (!text && fileBase64) {
-            text = Buffer.from(fileBase64, 'base64').toString('utf8');
+        const { csvText, fileBase64, defaultDepartmentId, defaultWardId, staff: staffRows } = req.body;
+        let rows = [];
+        if (Array.isArray(staffRows) && staffRows.length) {
+            rows = staffRows
+                .filter((s) => s.selected !== false)
+                .map((s) => {
+                    const names = s.firstName ? s : splitFullName(s.fullName);
+                    const ranks = expandRank(s.rankFull || s.rank || s.rankAbbr);
+                    return {
+                        firstName: names.firstName,
+                        lastName: names.lastName,
+                        rank: ranks.rankFull || s.rank,
+                        phone: s.phone || '',
+                        email: s.email || '',
+                        departmentName: s.departmentName,
+                        wardName: s.wardName,
+                        annualLeaveDays: s.annualLeaveDays,
+                        notes: s.notes || '',
+                        errors: (!names.firstName || !names.lastName) ? ['Missing name'] : [],
+                    };
+                });
+        } else {
+            let text = csvText;
+            if (!text && fileBase64) {
+                text = Buffer.from(String(fileBase64).split(',').pop(), 'base64').toString('utf8');
+            }
+            if (!text) return res.status(400).json({ error: 'csvText, fileBase64, or staff rows are required' });
+            rows = parseCsv(text).map((row) => {
+                const mapped = mapCsvRowToStaff(row);
+                const ranks = expandRank(mapped.rank);
+                return { ...mapped, rank: ranks.rankFull || mapped.rank };
+            });
         }
-        if (!text) return res.status(400).json({ error: 'csvText or fileBase64 is required' });
 
         const [deptSnap, wardSnap, staffCount] = await Promise.all([
             db.collection(`hospitals/${hospitalId}/departments`).get(),
@@ -86,7 +139,6 @@ router.post('/import', requireAuth, requireHospital, requireWriteAccess, async (
             && (!deptId || w.departmentId === deptId));
 
         const limits = getTierLimits(req.user.accountType || 'enterprise');
-        const rows = parseCsv(text);
         const errors = [];
         let imported = 0;
         const now = new Date().toISOString();
@@ -96,8 +148,8 @@ router.post('/import', requireAuth, requireHospital, requireWriteAccess, async (
                 errors.push({ row: idx + 2, reason: `Staff limit (${limits.maxStaff}) reached` });
                 break;
             }
-            const mapped = mapCsvRowToStaff(rows[idx]);
-            if (mapped.errors.length) {
+            const mapped = rows[idx];
+            if (mapped.errors?.length) {
                 errors.push({ row: idx + 2, reason: mapped.errors.join('; ') });
                 continue;
             }
@@ -142,6 +194,270 @@ router.post('/import', requireAuth, requireHospital, requireWriteAccess, async (
     }
 });
 
+function previewFromCsvText(text) {
+    const rows = parseCsv(text);
+    return rows.map((row, idx) => {
+        const mapped = mapCsvRowToStaff(row);
+        const ranks = expandRank(mapped.rank);
+        return {
+            key: `csv-${idx}`,
+            firstName: mapped.firstName,
+            lastName: mapped.lastName,
+            rank: ranks.rankFull || mapped.rank,
+            rankAbbr: ranks.rankAbbr,
+            phone: mapped.phone,
+            email: mapped.email,
+            notes: mapped.notes,
+            annualLeaveDays: mapped.annualLeaveDays,
+            departmentName: mapped.departmentName,
+            wardName: mapped.wardName,
+            selected: mapped.errors.length === 0,
+            errors: mapped.errors,
+        };
+    });
+}
+
+// POST /hospitals/:id/staff/parse-csv — preview only
+router.post('/parse-csv', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
+    try {
+        const { csvText, fileBase64 } = req.body;
+        let text = csvText;
+        if (!text && fileBase64) text = Buffer.from(String(fileBase64).split(',').pop(), 'base64').toString('utf8');
+        if (!text) return res.status(400).json({ error: 'csvText or fileBase64 is required' });
+        return res.json({ source: 'csv', staff: previewFromCsvText(text) });
+    } catch (err) {
+        logError('STAFF_API', 'CSV parse failed', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /hospitals/:id/staff/extract — Word roster preview, does not write
+router.post('/extract', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
+    try {
+        const buf = decodeUploadedFile(req.body);
+        if (!buf || buf.length < 100) return res.status(400).json({ error: 'Upload a .docx duty roster' });
+        const parsed = await parseDocxRoster(buf);
+        if (!parsed.rows.length) return res.status(400).json({ error: 'No staff rows found in that roster' });
+        const interpreted = interpretRosterGrid(parsed);
+        const refined = await refineExtractWithOpenAI(parsed, interpreted);
+        return res.json(stripInventedPii(refined));
+    } catch (err) {
+        logError('STAFF_API', 'Roster extract failed', err);
+        return res.status(400).json({ error: err.message || 'Could not read that roster' });
+    }
+});
+
+function shiftFromCode(shiftTypes, code) {
+    const map = { M: 'Morning', A: 'Afternoon', N: 'Night', SOD: 'SOD' };
+    const name = map[String(code || '').toUpperCase()];
+    if (!name) return null;
+    return (shiftTypes || []).find((st) => st.name === name || st.id === name.toLowerCase()) || null;
+}
+
+async function upsertSlimStaff({ hospitalId, departmentId, wardId, row, now }) {
+    const rank = (row.rankFull || row.rank || '').trim();
+    const firstName = (row.firstName || '').trim();
+    const lastName = (row.lastName || '').trim();
+    const payload = {
+        hospitalId,
+        departmentId,
+        wardId,
+        firstName,
+        lastName,
+        phone: row.phone?.trim() || '',
+        email: row.email?.trim() || '',
+        rank,
+        category: row.category || categoryFromRank(rank) || 'Nurse',
+        staffType: classifyStaffType(rank),
+        annualLeaveBalance: Number(row.annualLeaveDays ?? row.annualLeaveBalance) || 15,
+        employmentStatus: row.leaveType && /maternity|study/i.test(row.leaveType) ? 'On Leave' : 'Active',
+        wardRole: row.wardRole || 'regular',
+        workRestriction: /study/i.test(row.leaveType || '') ? 'studyLeave' : (row.workRestriction || 'none'),
+        noNightShift: Boolean(row.noNightShift),
+        maternityNoNight: Boolean(row.maternityNoNight) || /maternity/i.test(row.leaveType || ''),
+        preferredOffDays: Array.isArray(row.preferredOffDays) ? row.preferredOffDays : [],
+        preferredShifts: Array.isArray(row.preferredShifts) ? row.preferredShifts : [],
+        notes: row.notes || row.leaveNote || '',
+        updatedAt: now,
+    };
+    if (row.existingId) {
+        await db.doc(`hospitals/${hospitalId}/staff/${row.existingId}`).update(payload);
+        return row.existingId;
+    }
+    const ref = db.collection(`hospitals/${hospitalId}/staff`).doc();
+    await ref.set({ ...payload, leaveRecords: row.leaveRecords || [], createdAt: now });
+    return ref.id;
+}
+
+// POST /hospitals/:id/staff/import-roster — confirm extract into staff + draft schedule
+router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
+    try {
+        const { id: hospitalId } = req.params;
+        const {
+            staff: staffRows = [],
+            days = [],
+            defaultDepartmentId,
+            defaultWardId,
+            createSchedule = true,
+        } = req.body;
+
+        if (!defaultDepartmentId || !defaultWardId) {
+            return res.status(400).json({ error: 'Department and ward are required' });
+        }
+        const [deptSnap, wardSnap, hospitalSnap, existingSnap] = await Promise.all([
+            db.doc(`hospitals/${hospitalId}/departments/${defaultDepartmentId}`).get(),
+            db.doc(`hospitals/${hospitalId}/wards/${defaultWardId}`).get(),
+            db.doc(`hospitals/${hospitalId}`).get(),
+            db.collection(`hospitals/${hospitalId}/staff`).get(),
+        ]);
+        if (!deptSnap.exists) return res.status(404).json({ error: 'Department not found' });
+        if (!wardSnap.exists) return res.status(404).json({ error: 'Ward not found' });
+        if (!hospitalSnap.exists) return res.status(404).json({ error: 'Hospital not found' });
+
+        const limits = getTierLimits(req.user.accountType || 'enterprise');
+        const byName = new Map();
+        existingSnap.docs.forEach((d) => {
+            const x = d.data();
+            byName.set(`${x.firstName || ''} ${x.lastName || ''}`.trim().toLowerCase(), d);
+        });
+
+        const selected = staffRows.filter((s) => s.selected !== false && (s.firstName || s.fullName));
+        if (!selected.length) return res.status(400).json({ error: 'No staff rows selected' });
+        if (existingSnap.size + selected.filter((s) => !byName.get(`${s.firstName} ${s.lastName}`.trim().toLowerCase())).length > limits.maxStaff) {
+            return res.status(400).json({ error: `Staff limit (${limits.maxStaff}) reached` });
+        }
+
+        const now = new Date().toISOString();
+        let dateList = (days.length ? days : []).map((d) => d.date).filter(Boolean).sort();
+        if (dateList.length > 31) dateList = dateList.slice(0, 31);
+        const startDate = dateList[0];
+        const endDate = dateList[dateList.length - 1];
+        const inRange = new Set(dateList);
+        const staffIds = [];
+
+        for (const row of selected) {
+            const names = row.firstName ? row : splitFullName(row.fullName);
+            const ranks = expandRank(row.rankFull || row.rank || row.rankAbbr);
+            const nameKey = `${names.firstName} ${names.lastName}`.trim().toLowerCase();
+            const existing = byName.get(nameKey);
+            const leaveRecords = [];
+            if (row.leaveType && startDate && endDate) {
+                leaveRecords.push({
+                    id: randomUUID(),
+                    startDate: `${startDate}T00:00:00.000Z`,
+                    endDate: `${endDate}T23:59:59.000Z`,
+                    leaveType: row.leaveType,
+                    status: 'Approved',
+                    notes: row.leaveNote || '',
+                });
+            }
+            const id = await upsertSlimStaff({
+                hospitalId,
+                departmentId: defaultDepartmentId,
+                wardId: defaultWardId,
+                now,
+                row: {
+                    ...row,
+                    firstName: names.firstName,
+                    lastName: names.lastName,
+                    rankFull: ranks.rankFull || row.rank,
+                    existingId: existing?.id,
+                    leaveRecords: existing ? undefined : leaveRecords,
+                },
+            });
+            if (existing && leaveRecords.length) {
+                const prev = existing.data().leaveRecords || [];
+                await db.doc(`hospitals/${hospitalId}/staff/${id}`).update({
+                    leaveRecords: [...prev, ...leaveRecords],
+                });
+            }
+            staffIds.push({ row, id });
+        }
+
+        let scheduleId = null;
+        let assignmentCount = 0;
+        if (createSchedule && startDate && endDate) {
+            const start = new Date(`${startDate}T00:00:00.000Z`);
+            const end = new Date(`${endDate}T00:00:00.000Z`);
+            const holidays = [];
+            const holidayDates = new Set();
+            for (const { row } of staffIds) {
+                for (const cell of row.cells || []) {
+                    if (String(cell.code).toUpperCase() === 'H' && cell.date && inRange.has(cell.date) && !holidayDates.has(cell.date)) {
+                        holidayDates.add(cell.date);
+                        holidays.push({ date: `${cell.date}T00:00:00.000Z`, name: 'Holiday' });
+                    }
+                }
+            }
+
+            const dupSnap = await db.collection(`hospitals/${hospitalId}/schedules`)
+                .where('wardId', '==', defaultWardId)
+                .where('startDate', '==', start.toISOString())
+                .get();
+            let schedRef;
+            if (!dupSnap.empty) {
+                schedRef = dupSnap.docs[0].ref;
+            } else {
+                schedRef = db.collection(`hospitals/${hospitalId}/schedules`).doc();
+                await schedRef.set({
+                    hospitalId,
+                    departmentId: defaultDepartmentId,
+                    wardId: defaultWardId,
+                    name: req.body.title || `${wardSnap.data().name} duty roster`,
+                    startDate: start.toISOString(),
+                    endDate: new Date(end.getTime() + 24 * 3600 * 1000 - 1).toISOString(),
+                    holidays,
+                    status: 'draft',
+                    publishedAt: null,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            }
+            scheduleId = schedRef.id;
+
+            const shiftTypes = hospitalSnap.data().shiftTypes || [];
+            const assignDocs = [];
+            for (const { row, id } of staffIds) {
+                for (const a of row.assignments || []) {
+                    if (!inRange.has(a.date)) continue;
+                    const shift = shiftFromCode(shiftTypes, a.code);
+                    if (!shift) continue;
+                    assignDocs.push({
+                        scheduleId,
+                        hospitalId,
+                        staffId: id,
+                        departmentId: defaultDepartmentId,
+                        wardId: defaultWardId,
+                        date: `${a.date}T00:00:00.000Z`,
+                        shiftType: { name: shift.name, color: shift.color, startTime: shift.startTime, endTime: shift.endTime },
+                        createdAt: now,
+                    });
+                }
+            }
+            if (assignDocs.length) {
+                await batchedSet(schedRef.collection('assignments'), assignDocs);
+                assignmentCount = assignDocs.length;
+            }
+        }
+
+        logDataModification('IMPORT', 'staff-roster', hospitalId, {
+            imported: staffIds.length,
+            scheduleId,
+            assignmentCount,
+        });
+        return res.json({
+            imported: staffIds.length,
+            failed: 0,
+            errors: [],
+            scheduleId,
+            assignmentCount,
+        });
+    } catch (err) {
+        logError('STAFF_API', 'Roster import failed', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // GET /hospitals/:id/staff/:staffId
 router.get('/:staffId', requireAuth, requireHospital, async (req, res) => {
     try {
@@ -178,27 +494,21 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
         if (!wardSnap.exists) return res.status(404).json({ error: 'Ward not found for this department' });
 
         const now = new Date().toISOString();
+        const rank = body.rank?.trim() || '';
         const staffData = {
             hospitalId,
             departmentId: body.departmentId,
             wardId: body.wardId,
             firstName: body.firstName.trim(),
             lastName: body.lastName.trim(),
-            employeeId: body.employeeId?.trim() || '',
-            ghanaCardNumber: body.ghanaCardNumber?.trim() || '',
-            dateOfBirth: body.dateOfBirth || '',
             gender: body.gender || '',
             phone: body.phone?.trim() || '',
             email: body.email?.trim() || '',
-            address: body.address?.trim() || '',
-            category: body.category || 'Nurse',
-            rank: body.rank?.trim() || '',
-            staffType: classifyStaffType(body.rank),
+            category: body.category || categoryFromRank(rank) || 'Nurse',
+            rank,
+            staffType: classifyStaffType(rank),
             qualification: body.qualification || '',
             specialization: body.specialization?.trim() || '',
-            licenseType: body.licenseType || '',
-            licenseNumber: body.licenseNumber?.trim() || '',
-            licenseExpiry: body.licenseExpiry || '',
             dateHired: body.dateHired || '',
             employmentStatus: body.employmentStatus || 'Active',
             wardRole: body.wardRole || 'regular',
@@ -207,7 +517,6 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
             maternityNoNight: Boolean(body.maternityNoNight),
             preferredOffDays: Array.isArray(body.preferredOffDays) ? body.preferredOffDays : [],
             preferredShifts: Array.isArray(body.preferredShifts) ? body.preferredShifts : [],
-            emergencyContact: body.emergencyContact || {},
             annualLeaveBalance: body.annualLeaveBalance ?? 15,
             isRotation: Boolean(body.isRotation),
             leaveRecords: [],
@@ -251,10 +560,10 @@ router.patch('/:staffId', requireAuth, requireHospital, requireWriteAccess, asyn
         }
 
         const allowed = [
-            'firstName', 'lastName', 'employeeId', 'ghanaCardNumber', 'dateOfBirth', 'gender',
-            'phone', 'email', 'address', 'category', 'rank', 'qualification', 'specialization',
-            'licenseType', 'licenseNumber', 'licenseExpiry', 'dateHired', 'employmentStatus',
-            'emergencyContact', 'annualLeaveBalance', 'departmentId', 'wardId',
+            'firstName', 'lastName', 'gender',
+            'phone', 'email', 'category', 'rank', 'qualification', 'specialization',
+            'dateHired', 'employmentStatus',
+            'annualLeaveBalance', 'departmentId', 'wardId',
             'wardRole', 'workRestriction', 'noNightShift', 'maternityNoNight',
             'preferredOffDays', 'preferredShifts', 'isRotation',
         ];

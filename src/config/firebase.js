@@ -2,8 +2,20 @@ import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 
+function normalizePrivateKey(raw) {
+    if (!raw) return '';
+    let key = String(raw).trim();
+    if (
+        (key.startsWith('"') && key.endsWith('"'))
+        || (key.startsWith("'") && key.endsWith("'"))
+    ) {
+        key = key.slice(1, -1);
+    }
+    return key.replace(/\\n/g, '\n');
+}
+
 if (!getApps().length) {
-    const privateKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY?.replace(/\\n/g, '\n');
+    const privateKey = normalizePrivateKey(process.env.FIREBASE_ADMIN_PRIVATE_KEY);
 
     if (!process.env.FIREBASE_ADMIN_PROJECT_ID || !process.env.FIREBASE_ADMIN_CLIENT_EMAIL || !privateKey) {
         throw new Error(
