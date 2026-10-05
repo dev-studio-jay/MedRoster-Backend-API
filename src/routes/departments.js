@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db } from '../config/firebase.js';
 import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
+import { normalizeOrgName } from '../lib/org-dedupe.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router({ mergeParams: true });
@@ -26,6 +27,12 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
 
         const now = new Date().toISOString();
         const coll = db.collection(`hospitals/${hospitalId}/departments`);
+        const existingSnap = await coll.get();
+        const existingByName = new Map();
+        for (const doc of existingSnap.docs) {
+            const key = normalizeOrgName(doc.data().name);
+            if (key && !existingByName.has(key)) existingByName.set(key, { _id: doc.id, ...doc.data() });
+        }
 
         // Bulk create
         if (Array.isArray(req.body.departments)) {
@@ -34,12 +41,21 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
                 .map((d) => ({ name: String(d.name || '').trim(), description: String(d.description || '').trim() }))
                 .filter((d) => {
                     if (!d.name) return false;
-                    const key = d.name.toLowerCase();
-                    if (seen.has(key)) return false;
+                    const key = normalizeOrgName(d.name);
+                    if (seen.has(key) || existingByName.has(key)) return false;
                     seen.add(key);
                     return true;
                 });
-            if (!valid.length) return res.status(400).json({ error: 'No valid department names provided' });
+            if (!valid.length) {
+                const requested = new Set(
+                    req.body.departments.map((d) => normalizeOrgName(d.name)).filter(Boolean)
+                );
+                const existing = [...existingByName.entries()]
+                    .filter(([key]) => requested.has(key))
+                    .map(([, value]) => value);
+                if (existing.length) return res.status(200).json(existing);
+                return res.status(400).json({ error: 'No valid department names provided' });
+            }
 
             const created = [];
             const batch = db.batch();
@@ -58,6 +74,8 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
         // Single create
         const name = String(req.body.name || '').trim();
         if (!name) return res.status(400).json({ error: 'Department name is required' });
+        const existing = existingByName.get(normalizeOrgName(name));
+        if (existing) return res.status(200).json(existing);
 
         const ref = coll.doc();
         const data = { hospitalId, name, description: String(req.body.description || '').trim(), isActive: true, createdAt: now, updatedAt: now };

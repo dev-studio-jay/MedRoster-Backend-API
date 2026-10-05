@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db } from '../config/firebase.js';
 import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
+import { normalizeOrgName } from '../lib/org-dedupe.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router({ mergeParams: true });
@@ -36,6 +37,12 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
         ]);
         if (!hospitalSnap.exists) return res.status(404).json({ error: 'Hospital not found' });
         if (!deptSnap.exists) return res.status(404).json({ error: 'Department not found' });
+
+        const existingWards = await db.collection(`hospitals/${hospitalId}/wards`)
+            .where('departmentId', '==', departmentId)
+            .get();
+        const duplicate = existingWards.docs.find((doc) => normalizeOrgName(doc.data().name) === normalizeOrgName(name));
+        if (duplicate) return res.status(200).json({ _id: duplicate.id, ...duplicate.data() });
 
         const now = new Date().toISOString();
         const ref = db.collection(`hospitals/${hospitalId}/wards`).doc();

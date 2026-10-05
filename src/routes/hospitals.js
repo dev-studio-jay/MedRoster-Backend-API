@@ -4,6 +4,7 @@ import { requireAuth, requireHospital, requireAdmin, requireWriteAccess } from '
 import { findHospitalByJoinCode } from '../lib/hospital-utils.js';
 import { isValidJoinCodeFormat, joinCodeKey, normalizeJoinCode } from '../lib/hospital-code.js';
 import { ACCOUNT_TYPES } from '../lib/tier-limits.js';
+import { hasNameDuplicates, mergeDuplicateOrgUnits, normalizeOrgName } from '../lib/org-dedupe.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router();
@@ -65,15 +66,28 @@ router.get('/:id', requireAuth, requireHospital, async (req, res) => {
         const snap = await db.doc(`hospitals/${hospitalId}`).get();
         if (!snap.exists) return res.status(404).json({ error: 'Hospital not found' });
 
-        const [deptSnap, wardSnap, staffCount, schedCount] = await Promise.all([
+        let [deptSnap, wardSnap, staffCount, schedCount] = await Promise.all([
             db.collection(`hospitals/${hospitalId}/departments`).orderBy('name').get(),
             db.collection(`hospitals/${hospitalId}/wards`).orderBy('name').get(),
             db.collection(`hospitals/${hospitalId}/staff`).count().get(),
             db.collection(`hospitals/${hospitalId}/schedules`).count().get(),
         ]);
 
-        const departments = deptSnap.docs.map((d) => ({ _id: d.id, ...d.data() }));
-        const wards = wardSnap.docs.map((w) => ({ _id: w.id, ...w.data() }));
+        let departments = deptSnap.docs.map((d) => ({ _id: d.id, ...d.data() }));
+        let wards = wardSnap.docs.map((w) => ({ _id: w.id, ...w.data() }));
+        const hasDupes = hasNameDuplicates(departments, (d) => normalizeOrgName(d.name))
+            || hasNameDuplicates(wards, (w) => `${w.departmentId}::${normalizeOrgName(w.name)}`);
+        if (hasDupes) {
+            await mergeDuplicateOrgUnits(hospitalId);
+            [deptSnap, wardSnap, staffCount, schedCount] = await Promise.all([
+                db.collection(`hospitals/${hospitalId}/departments`).orderBy('name').get(),
+                db.collection(`hospitals/${hospitalId}/wards`).orderBy('name').get(),
+                db.collection(`hospitals/${hospitalId}/staff`).count().get(),
+                db.collection(`hospitals/${hospitalId}/schedules`).count().get(),
+            ]);
+            departments = deptSnap.docs.map((d) => ({ _id: d.id, ...d.data() }));
+            wards = wardSnap.docs.map((w) => ({ _id: w.id, ...w.data() }));
+        }
 
         const data = docToJson(snap);
         if (req.user.role === 'staff') {
