@@ -25,7 +25,7 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
 }));
-app.use(express.json({ limit: '8mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')

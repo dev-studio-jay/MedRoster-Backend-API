@@ -5,8 +5,7 @@ import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/
 import { classifyStaffType } from '../lib/staff-utils.js';
 import { buildStaffCsvTemplate, mapCsvRowToStaff, parseCsv } from '../lib/staff-csv.js';
 import { categoryFromRank, expandRank, splitFullName } from '../lib/rank-abbr.js';
-import { parseDocxRoster } from '../lib/docx-roster.js';
-import { interpretRosterGrid, refineExtractWithOpenAI, stripInventedPii } from '../lib/roster-extract.js';
+import { extractRosterPreview } from '../lib/roster-ingest.js';
 import { getTierLimits } from '../lib/tier-limits.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
@@ -231,16 +230,14 @@ router.post('/parse-csv', requireAuth, requireHospital, requireWriteAccess, asyn
     }
 });
 
-// POST /hospitals/:id/staff/extract — Word roster preview, does not write
+// POST /hospitals/:id/staff/extract — roster preview (docx/xlsx/pdf/image), does not write
 router.post('/extract', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const buf = decodeUploadedFile(req.body);
-        if (!buf || buf.length < 100) return res.status(400).json({ error: 'Upload a .docx duty roster' });
-        const parsed = await parseDocxRoster(buf);
-        if (!parsed.rows.length) return res.status(400).json({ error: 'No staff rows found in that roster' });
-        const interpreted = interpretRosterGrid(parsed);
-        const refined = await refineExtractWithOpenAI(parsed, interpreted);
-        return res.json(stripInventedPii(refined));
+        if (!buf || buf.length < 32) return res.status(400).json({ error: 'Upload a duty roster file' });
+        const preview = await extractRosterPreview({ buffer: buf, fileName: req.body.fileName || '' });
+        if (!preview.staff?.length) return res.status(400).json({ error: 'No staff rows found in that roster' });
+        return res.json(preview);
     } catch (err) {
         logError('STAFF_API', 'Roster extract failed', err);
         return res.status(400).json({ error: err.message || 'Could not read that roster' });
