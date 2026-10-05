@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
-import { db } from '../config/firebase.js';
-import { requireAuth, requireHospital } from '../middleware/auth.js';
+import { db, batchedDelete } from '../config/firebase.js';
+import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
 import { classifyStaffType } from '../lib/staff-utils.js';
+import { buildStaffCsvTemplate, mapCsvRowToStaff, parseCsv } from '../lib/staff-csv.js';
+import { getTierLimits } from '../lib/tier-limits.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router({ mergeParams: true });
@@ -40,6 +42,106 @@ router.get('/', requireAuth, requireHospital, async (req, res) => {
     }
 });
 
+// GET /hospitals/:id/staff/template/download — must be before /:staffId
+router.get('/template/download', requireAuth, requireHospital, async (req, res) => {
+    try {
+        const { id: hospitalId } = req.params;
+        const [deptSnap, wardSnap] = await Promise.all([
+            db.collection(`hospitals/${hospitalId}/departments`).orderBy('name').get(),
+            db.collection(`hospitals/${hospitalId}/wards`).orderBy('name').get(),
+        ]);
+        const csv = buildStaffCsvTemplate({
+            departments: deptSnap.docs.map((d) => d.data()),
+            wards: wardSnap.docs.map((w) => w.data()),
+        });
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="medroster-staff-template.csv"');
+        return res.send(csv);
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /hospitals/:id/staff/import
+router.post('/import', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
+    try {
+        const { id: hospitalId } = req.params;
+        const { csvText, fileBase64, defaultDepartmentId, defaultWardId } = req.body;
+        let text = csvText;
+        if (!text && fileBase64) {
+            text = Buffer.from(fileBase64, 'base64').toString('utf8');
+        }
+        if (!text) return res.status(400).json({ error: 'csvText or fileBase64 is required' });
+
+        const [deptSnap, wardSnap, staffCount] = await Promise.all([
+            db.collection(`hospitals/${hospitalId}/departments`).get(),
+            db.collection(`hospitals/${hospitalId}/wards`).get(),
+            db.collection(`hospitals/${hospitalId}/staff`).count().get(),
+        ]);
+        const depts = deptSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const wards = wardSnap.docs.map((w) => ({ id: w.id, ...w.data() }));
+        const findDept = (name) => depts.find((d) => d.name?.toLowerCase() === name?.toLowerCase());
+        const findWard = (name, deptId) => wards.find((w) =>
+            w.name?.toLowerCase() === name?.toLowerCase()
+            && (!deptId || w.departmentId === deptId));
+
+        const limits = getTierLimits(req.user.accountType || 'enterprise');
+        const rows = parseCsv(text);
+        const errors = [];
+        let imported = 0;
+        const now = new Date().toISOString();
+
+        for (let idx = 0; idx < rows.length; idx++) {
+            if (staffCount.data().count + imported >= limits.maxStaff) {
+                errors.push({ row: idx + 2, reason: `Staff limit (${limits.maxStaff}) reached` });
+                break;
+            }
+            const mapped = mapCsvRowToStaff(rows[idx]);
+            if (mapped.errors.length) {
+                errors.push({ row: idx + 2, reason: mapped.errors.join('; ') });
+                continue;
+            }
+            const dept = mapped.departmentName ? findDept(mapped.departmentName) : null;
+            const departmentId = dept?.id || defaultDepartmentId;
+            const ward = mapped.wardName ? findWard(mapped.wardName, departmentId) : null;
+            const wardId = ward?.id || defaultWardId;
+            if (!departmentId || !wardId) {
+                errors.push({ row: idx + 2, reason: 'Department/ward not found — set defaults or match template names' });
+                continue;
+            }
+
+            const ref = db.collection(`hospitals/${hospitalId}/staff`).doc();
+            await ref.set({
+                hospitalId,
+                departmentId,
+                wardId,
+                firstName: mapped.firstName,
+                lastName: mapped.lastName,
+                phone: mapped.phone,
+                email: mapped.email,
+                rank: mapped.rank,
+                category: 'Nurse',
+                staffType: classifyStaffType(mapped.rank),
+                annualLeaveEntitlement: mapped.annualLeaveDays || 0,
+                employmentStatus: 'Active',
+                wardRole: 'regular',
+                workRestriction: 'none',
+                leaveRecords: [],
+                notes: mapped.notes || '',
+                createdAt: now,
+                updatedAt: now,
+            });
+            imported++;
+        }
+
+        logDataModification('IMPORT', 'staff', hospitalId, { imported, failed: errors.length });
+        return res.json({ imported, failed: errors.length, errors });
+    } catch (err) {
+        logError('STAFF_API', 'Import failed', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // GET /hospitals/:id/staff/:staffId
 router.get('/:staffId', requireAuth, requireHospital, async (req, res) => {
     try {
@@ -54,7 +156,7 @@ router.get('/:staffId', requireAuth, requireHospital, async (req, res) => {
 });
 
 // POST /hospitals/:id/staff
-router.post('/', requireAuth, requireHospital, async (req, res) => {
+router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId } = req.params;
         const body = req.body;
@@ -129,7 +231,7 @@ router.post('/', requireAuth, requireHospital, async (req, res) => {
 });
 
 // PATCH /hospitals/:id/staff/:staffId
-router.patch('/:staffId', requireAuth, requireHospital, async (req, res) => {
+router.patch('/:staffId', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, staffId } = req.params;
         const ref = db.doc(`hospitals/${hospitalId}/staff/${staffId}`);
@@ -174,25 +276,22 @@ router.patch('/:staffId', requireAuth, requireHospital, async (req, res) => {
 });
 
 // DELETE /hospitals/:id/staff/:staffId
-router.delete('/:staffId', requireAuth, requireHospital, async (req, res) => {
+router.delete('/:staffId', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, staffId } = req.params;
         const ref = db.doc(`hospitals/${hospitalId}/staff/${staffId}`);
         const snap = await ref.get();
         if (!snap.exists) return res.status(404).json({ error: 'Staff not found' });
         const staffData = snap.data();
-        await ref.delete();
 
-        // Cascade: delete this staff member's assignments from all schedules
         const schedSnap = await db.collection(`hospitals/${hospitalId}/schedules`).get();
+        const assignmentRefs = [];
         for (const schedDoc of schedSnap.docs) {
             const assignSnap = await schedDoc.ref.collection('assignments').where('staffId', '==', staffId).get();
-            if (assignSnap.size > 0) {
-                const batch = db.batch();
-                assignSnap.docs.forEach((d) => batch.delete(d.ref));
-                await batch.commit();
-            }
+            assignmentRefs.push(...assignSnap.docs.map((d) => d.ref));
         }
+        await batchedDelete(assignmentRefs);
+        await ref.delete();
 
         logDataModification('DELETE', 'staff', staffId, { name: `${staffData.firstName} ${staffData.lastName}` });
         return res.json({ success: true });
@@ -218,7 +317,7 @@ router.get('/:staffId/leave', requireAuth, requireHospital, async (req, res) => 
 });
 
 // POST /hospitals/:id/staff/:staffId/leave
-router.post('/:staffId/leave', requireAuth, requireHospital, async (req, res) => {
+router.post('/:staffId/leave', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, staffId } = req.params;
         const { startDate, endDate, leaveType, notes } = req.body;
@@ -257,9 +356,7 @@ router.post('/:staffId/leave', requireAuth, requireHospital, async (req, res) =>
                 return assignDate >= start && assignDate <= end;
             });
             if (toDelete.length > 0) {
-                const batch = db.batch();
-                toDelete.forEach((d) => batch.delete(d.ref));
-                await batch.commit();
+                await batchedDelete(toDelete.map((d) => d.ref));
                 removedAssignments += toDelete.length;
             }
         }
@@ -282,7 +379,7 @@ router.post('/:staffId/leave', requireAuth, requireHospital, async (req, res) =>
 });
 
 // DELETE /hospitals/:id/staff/:staffId/leave?leaveId=...
-router.delete('/:staffId/leave', requireAuth, requireHospital, async (req, res) => {
+router.delete('/:staffId/leave', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, staffId } = req.params;
         const { leaveId } = req.query;

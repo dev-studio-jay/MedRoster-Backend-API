@@ -1,5 +1,7 @@
 # MedRoster — Backend API
 
+**Blaze Studios** · MedRoster API
+
 Standalone Express API for MedRoster. Authenticates requests with **Firebase Auth** ID tokens and stores hospital data in **Cloud Firestore**.
 
 Consumed by the [web frontend](https://github.com/blaze308/medroster-frontend) and [Flutter app](https://github.com/blaze308/medroster-app).

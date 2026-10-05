@@ -42,6 +42,15 @@ export async function batchedDelete(refs) {
     }
 }
 
+export async function batchedUpdate(entries) {
+    const chunks = chunkArray(entries, 499);
+    for (const chunk of chunks) {
+        const batch = db.batch();
+        chunk.forEach(({ ref, data }) => batch.update(ref, data));
+        await batch.commit();
+    }
+}
+
 export async function batchedSet(collRef, docs) {
     const chunks = chunkArray(docs, 499);
     for (const chunk of chunks) {

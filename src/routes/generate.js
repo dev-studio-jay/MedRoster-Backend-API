@@ -1,7 +1,13 @@
 import { Router } from 'express';
 import { db, batchedDelete, batchedSet } from '../config/firebase.js';
-import { requireAuth, requireHospital } from '../middleware/auth.js';
+import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
 import { isStaffOnLeave, classifyStaffType } from '../lib/staff-utils.js';
+import {
+    hoursForStaffInWeekContaining,
+    scaledOffDayTarget,
+    shiftDurationHours,
+    shiftsOverlap,
+} from '../lib/validation.js';
 import { logAutoGeneration, logError } from '../lib/logger.js';
 
 const router = Router({ mergeParams: true });
@@ -68,7 +74,7 @@ function preferenceScore(staff, day, shift, usePreferences) {
 }
 
 // POST /hospitals/:id/schedules/:schedId/generate
-router.post('/:schedId', requireAuth, requireHospital, async (req, res) => {
+router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     const t0 = Date.now();
     try {
         const { id: hospitalId, schedId } = req.params;
@@ -94,25 +100,25 @@ router.post('/:schedId', requireAuth, requireHospital, async (req, res) => {
             return res.status(400).json({ error: 'No staff available to schedule' });
         }
 
-        // Clear existing assignments for this ward/schedule
         const existingSnap = await db.collection(`hospitals/${hospitalId}/schedules/${schedId}/assignments`).get();
-        await batchedDelete(existingSnap.docs.map((d) => d.ref));
+        const existingRefs = existingSnap.docs.map((d) => d.ref);
 
         const shiftTypes = hospitalData.shiftTypes || [];
         const settings = hospitalData.settings || {};
         const minSenior = settings.minSeniorStaffPerDay ?? 1;
         const maxConsecutive = settings.maxConsecutiveDays ?? 6;
-        const maxNights = Math.max(settings.maxConsecutiveNights ?? 3, 3);
-        const hardNightCap = 4;
+        const maxNights = settings.maxConsecutiveNights ?? 3;
+        const maxHoursPerWeek = settings.maxHoursPerWeek ?? 48;
 
         const days = buildCycleDays(schedule);
         const holidays = holidaySet(schedule);
         const holidayCount = holidays.size;
+        const scheduleStart = days[0] || new Date(schedule.startDate);
 
         const maxWorkDaysByStaff = new Map(
             allStaff.map((s) => {
                 if ((s.wardRole || 'regular') !== 'regular') return [s._id, days.length];
-                return [s._id, Math.max(0, days.length - (12 + holidayCount))];
+                return [s._id, Math.max(0, days.length - scaledOffDayTarget(days.length, holidayCount))];
             })
         );
 
@@ -143,9 +149,13 @@ router.post('/:schedId', requireAuth, requireHospital, async (req, res) => {
 
             const assignedToday = new Set();
             const seniorAssignedToday = new Set();
+            const filledShiftsToday = [];
 
             for (const shift of shiftTypes) {
+                if (filledShiftsToday.some((filled) => shiftsOverlap(filled, shift))) continue;
+
                 const isNight = shift.name === 'Night';
+                const shiftHours = shiftDurationHours(shift);
 
                 const pool = allStaff.filter((s) => {
                     const sid = s._id;
@@ -153,7 +163,14 @@ router.post('/:schedId', requireAuth, requireHospital, async (req, res) => {
                     if (!canWorkShift(s, day, shift, holidays)) return false;
                     if ((consecutiveTracker.get(sid) || 0) >= maxConsecutive) return false;
                     if ((assignmentCounts.get(sid) || 0) >= (maxWorkDaysByStaff.get(sid) ?? days.length)) return false;
-                    if (isNight && (consecutiveNightTracker.get(sid) || 0) >= hardNightCap) return false;
+                    if (isNight && (consecutiveNightTracker.get(sid) || 0) >= maxNights) return false;
+                    const weekHours = hoursForStaffInWeekContaining({
+                        assignments: created,
+                        staffId: sid,
+                        date: day,
+                        scheduleStart,
+                    });
+                    if (weekHours + shiftHours > maxHoursPerWeek) return false;
                     return true;
                 });
 
@@ -190,23 +207,25 @@ router.post('/:schedId', requireAuth, requireHospital, async (req, res) => {
                 assignmentCounts.set(sid, (assignmentCounts.get(sid) || 0) + 1);
                 consecutiveTracker.set(sid, (consecutiveTracker.get(sid) || 0) + 1);
                 if (isNight) {
-                    const nights = (consecutiveNightTracker.get(sid) || 0) + 1;
-                    consecutiveNightTracker.set(sid, nights);
-                    if (nights > maxNights) {
-                        warnings.push(`${pick.firstName} ${pick.lastName} reached ${nights} consecutive nights`);
-                    }
+                    consecutiveNightTracker.set(sid, (consecutiveNightTracker.get(sid) || 0) + 1);
                 } else {
                     consecutiveNightTracker.set(sid, 0);
                 }
                 lastWorkedDate.set(sid, day);
                 assignedToday.add(sid);
+                filledShiftsToday.push(shift);
                 if (seniorIds.has(sid)) seniorAssignedToday.add(sid);
             }
         }
 
-        if (created.length > 0) {
-            const assignColl = db.collection(`hospitals/${hospitalId}/schedules/${schedId}/assignments`);
-            await batchedSet(assignColl, created);
+        if (created.length === 0) {
+            return res.status(400).json({ error: 'Could not generate any assignments', warnings });
+        }
+
+        const assignColl = db.collection(`hospitals/${hospitalId}/schedules/${schedId}/assignments`);
+        await batchedSet(assignColl, created);
+        if (existingRefs.length > 0) {
+            await batchedDelete(existingRefs);
         }
 
         logAutoGeneration(schedId, allStaff.length, created.length, Date.now() - t0);

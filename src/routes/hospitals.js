@@ -1,6 +1,9 @@
 import { Router } from 'express';
-import { db, docToJson } from '../config/firebase.js';
-import { requireAuth, requireHospital } from '../middleware/auth.js';
+import { db, batchedDelete, batchedUpdate, docToJson } from '../config/firebase.js';
+import { requireAuth, requireHospital, requireAdmin, requireWriteAccess } from '../middleware/auth.js';
+import { findHospitalByJoinCode } from '../lib/hospital-utils.js';
+import { isValidJoinCodeFormat, joinCodeKey, normalizeJoinCode } from '../lib/hospital-code.js';
+import { ACCOUNT_TYPES } from '../lib/tier-limits.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router();
@@ -8,7 +11,10 @@ const router = Router();
 // GET /hospitals — returns authenticated user's hospital with summary counts.
 router.get('/', requireAuth, async (req, res) => {
     try {
-        const { hospitalId } = req.user;
+        const { hospitalId, accountType } = req.user;
+        if (!hospitalId) {
+            return res.json([]);
+        }
         const snap = await db.doc(`hospitals/${hospitalId}`).get();
         if (!snap.exists) return res.status(404).json({ error: 'Hospital not found' });
 
@@ -21,6 +27,7 @@ router.get('/', requireAuth, async (req, res) => {
 
         return res.json([{
             ...docToJson(snap),
+            accountType: accountType || ACCOUNT_TYPES.ENTERPRISE,
             counts: {
                 departments: depCount.data().count,
                 wards: wardCount.data().count,
@@ -30,6 +37,23 @@ router.get('/', requireAuth, async (req, res) => {
         }]);
     } catch (err) {
         logError('HOSPITALS_API', 'Failed to list hospitals', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /hospitals/lookup/:code — preview hospital name before joining
+router.get('/lookup/:code', requireAuth, async (req, res) => {
+    try {
+        const hospital = await findHospitalByJoinCode(req.params.code);
+        if (!hospital) return res.status(404).json({ error: 'No hospital found for that code' });
+        return res.json({
+            hospitalId: hospital.id,
+            name: hospital.name,
+            type: hospital.type,
+            region: hospital.region,
+            joinCode: hospital.joinCode,
+        });
+    } catch (err) {
         return res.status(500).json({ error: err.message });
     }
 });
@@ -51,8 +75,14 @@ router.get('/:id', requireAuth, requireHospital, async (req, res) => {
         const departments = deptSnap.docs.map((d) => ({ _id: d.id, ...d.data() }));
         const wards = wardSnap.docs.map((w) => ({ _id: w.id, ...w.data() }));
 
+        const data = docToJson(snap);
+        if (req.user.role === 'staff') {
+            delete data.joinCode;
+            delete data.joinCodeKey;
+        }
+
         return res.json({
-            ...docToJson(snap),
+            ...data,
             departments,
             wards,
             counts: {
@@ -69,7 +99,7 @@ router.get('/:id', requireAuth, requireHospital, async (req, res) => {
 });
 
 // PATCH /hospitals/:id — update hospital fields or settings.
-router.patch('/:id', requireAuth, requireHospital, async (req, res) => {
+router.patch('/:id', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId } = req.params;
         const allowed = ['name', 'type', 'region', 'location', 'ghsCode', 'shiftTypes', 'settings'];
@@ -93,22 +123,57 @@ router.patch('/:id', requireAuth, requireHospital, async (req, res) => {
     }
 });
 
+// PATCH /hospitals/:id/join-code — admin edits join code
+router.patch('/:id/join-code', requireAuth, requireHospital, requireAdmin, async (req, res) => {
+    try {
+        const { id: hospitalId } = req.params;
+        const { newCode } = req.body;
+        if (!newCode || !isValidJoinCodeFormat(newCode)) {
+            return res.status(400).json({
+                error: 'Join code must be 6–9 alphanumeric characters (e.g. KBU-X7F or KORLEBU)',
+            });
+        }
+
+        let normalized = normalizeJoinCode(newCode);
+        const key = joinCodeKey(normalized);
+        if (key.length === 6 && !normalized.includes('-')) {
+            normalized = `${key.slice(0, 3)}-${key.slice(3)}`;
+        }
+
+        const clash = await db.collection('hospitals').where('joinCodeKey', '==', key).limit(1).get();
+        if (!clash.empty && clash.docs[0].id !== hospitalId) {
+            return res.status(409).json({ error: 'That join code is already taken' });
+        }
+
+        const ref = db.doc(`hospitals/${hospitalId}`);
+        await ref.update({
+            joinCode: normalized,
+            joinCodeKey: key,
+            updatedAt: new Date().toISOString(),
+        });
+
+        const updated = await ref.get();
+        logDataModification('UPDATE', 'hospital-join-code', hospitalId, { joinCode: updated.data().joinCode });
+        return res.json({ success: true, joinCode: updated.data().joinCode });
+    } catch (err) {
+        logError('HOSPITALS_API', 'Failed to update join code', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // DELETE /hospitals/:id — delete hospital and all subcollections.
-router.delete('/:id', requireAuth, requireHospital, async (req, res) => {
+router.delete('/:id', requireAuth, requireHospital, requireAdmin, async (req, res) => {
     try {
         const { id: hospitalId } = req.params;
         const hospitalRef = db.doc(`hospitals/${hospitalId}`);
         const snap = await hospitalRef.get();
         if (!snap.exists) return res.status(404).json({ error: 'Hospital not found' });
 
-        // Delete subcollections in order (assignments first as they're deepest)
         const schedSnap = await db.collection(`hospitals/${hospitalId}/schedules`).get();
         for (const schedDoc of schedSnap.docs) {
             const assignSnap = await schedDoc.ref.collection('assignments').get();
-            const batch = db.batch();
-            assignSnap.docs.forEach((d) => batch.delete(d.ref));
-            batch.delete(schedDoc.ref);
-            await batch.commit();
+            await batchedDelete(assignSnap.docs.map((d) => d.ref));
+            await schedDoc.ref.delete();
         }
 
         const [deptSnap, wardSnap, staffSnap] = await Promise.all([
@@ -117,10 +182,24 @@ router.delete('/:id', requireAuth, requireHospital, async (req, res) => {
             db.collection(`hospitals/${hospitalId}/staff`).get(),
         ]);
 
-        const batch = db.batch();
-        [...deptSnap.docs, ...wardSnap.docs, ...staffSnap.docs].forEach((d) => batch.delete(d.ref));
-        batch.delete(hospitalRef);
-        await batch.commit();
+        await batchedDelete([
+            ...deptSnap.docs.map((d) => d.ref),
+            ...wardSnap.docs.map((d) => d.ref),
+            ...staffSnap.docs.map((d) => d.ref),
+            hospitalRef,
+        ]);
+
+        const usersSnap = await db.collection('users').where('hospitalId', '==', hospitalId).get();
+        const now = new Date().toISOString();
+        await batchedUpdate(usersSnap.docs.map((u) => ({
+            ref: u.ref,
+            data: {
+                hospitalId: null,
+                accountType: ACCOUNT_TYPES.INDIVIDUAL,
+                role: null,
+                updatedAt: now,
+            },
+        })));
 
         logDataModification('DELETE', 'hospital', hospitalId, { name: snap.data().name });
         return res.json({ success: true });

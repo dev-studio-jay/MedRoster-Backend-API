@@ -27,6 +27,80 @@ function holidayKeys(schedule) {
     return new Set((schedule?.holidays || []).map((h) => dateKey(h.date || h)));
 }
 
+/** Hours covered by a shift, including overnight (end before start). */
+export function shiftDurationHours(shiftType) {
+    if (!shiftType?.startTime || !shiftType?.endTime) return 0;
+    const [sh, sm = 0] = String(shiftType.startTime).split(':').map(Number);
+    const [eh, em = 0] = String(shiftType.endTime).split(':').map(Number);
+    if (Number.isNaN(sh) || Number.isNaN(eh)) return 0;
+    let hours = (eh + em / 60) - (sh + sm / 60);
+    if (hours <= 0) hours += 24;
+    return hours;
+}
+
+function timeToMinutes(time) {
+    const [h, m = 0] = String(time || '00:00').split(':').map(Number);
+    return ((h || 0) * 60) + (m || 0);
+}
+
+/** True when two shifts share any open interval of time. Adjacent (end === start) does not overlap. */
+export function shiftsOverlap(a, b) {
+    if (!a?.startTime || !a?.endTime || !b?.startTime || !b?.endTime) return false;
+    let aStart = timeToMinutes(a.startTime);
+    let aEnd = timeToMinutes(a.endTime);
+    let bStart = timeToMinutes(b.startTime);
+    let bEnd = timeToMinutes(b.endTime);
+    if (aEnd <= aStart) aEnd += 24 * 60;
+    if (bEnd <= bStart) bEnd += 24 * 60;
+    return aStart < bEnd && bStart < aEnd;
+}
+
+/** Monthly off-day target is 12. Scale it to the cycle length, then add holidays. */
+export function scaledOffDayTarget(cycleDays, holidayCount = 0) {
+    const monthlyOff = 12;
+    const scaled = Math.round((monthlyOff * cycleDays) / 31);
+    return Math.min(cycleDays, Math.max(0, scaled + holidayCount));
+}
+
+function weekStartContaining(date, scheduleStart) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    const s = new Date(scheduleStart);
+    s.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((d - s) / (24 * 3600 * 1000));
+    const week = Math.floor(Math.max(0, diffDays) / 7);
+    const start = new Date(s);
+    start.setDate(start.getDate() + week * 7);
+    return start;
+}
+
+function earliestAssignmentDate(assignments) {
+    let min = null;
+    for (const a of assignments) {
+        const d = new Date(a.date);
+        if (Number.isNaN(d.getTime())) continue;
+        d.setHours(0, 0, 0, 0);
+        if (!min || d < min) min = d;
+    }
+    return min || new Date();
+}
+
+/** Hours this person already has in the 7-day window that contains `date`. */
+export function hoursForStaffInWeekContaining({ assignments, staffId, date, scheduleStart }) {
+    const target = String(staffId);
+    const weekStart = weekStartContaining(date, scheduleStart);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 7);
+    let total = 0;
+    for (const a of assignments) {
+        if (String(a.staffId) !== target) continue;
+        const ad = new Date(a.date);
+        ad.setHours(0, 0, 0, 0);
+        if (ad >= weekStart && ad < weekEnd) total += shiftDurationHours(a.shiftType);
+    }
+    return total;
+}
+
 function isHoliday(date, schedule) {
     return holidayKeys(schedule).has(dateKey(date));
 }
@@ -95,21 +169,25 @@ export function validateSupervisoryCoverage({ date, assignments, staffById, sett
     return { valid: true };
 }
 
-export function validateMaxHoursPerWeek({ staffId, assignments, settings }) {
+export function validateMaxHoursPerWeek({ staffId, assignments, settings, schedule }) {
     const maxHours = settings?.maxHoursPerWeek ?? 48;
     const target = String(staffId);
     const own = assignments.filter((a) => String(a.staffId) === target);
-    let total = 0;
-    own.forEach((a) => {
-        const st = a.shiftType;
-        if (!st?.startTime || !st?.endTime) return;
-        const [sh] = st.startTime.split(':').map(Number);
-        const [eh] = st.endTime.split(':').map(Number);
-        let hours = eh - sh;
-        if (hours < 0) hours += 24;
-        total += hours;
-    });
-    if (total > maxHours) return { valid: true, warning: `Total ${total}h this week (limit: ${maxHours}h)` };
+    if (!own.length) return { valid: true };
+
+    const scheduleStart = schedule?.startDate || earliestAssignmentDate(own);
+    const byWeek = new Map();
+    for (const a of own) {
+        const key = weekStartContaining(a.date, scheduleStart).toISOString().split('T')[0];
+        byWeek.set(key, (byWeek.get(key) || 0) + shiftDurationHours(a.shiftType));
+    }
+    let worst = 0;
+    for (const hours of byWeek.values()) {
+        if (hours > worst) worst = hours;
+    }
+    if (worst > maxHours) {
+        return { valid: true, warning: `Total ${Math.round(worst)}h in a 7-day window (limit: ${maxHours}h)` };
+    }
     return { valid: true };
 }
 
@@ -173,7 +251,12 @@ export function validateAssignment({ staff, date, shiftType, context }) {
         const r = validateConsecutiveShifts({ staffId: staff._id || staff.id, date, assignments, settings });
         if (r.warning) warnings.push(r.warning);
     }
-    const hoursCheck = validateMaxHoursPerWeek({ staffId: staff._id || staff.id, assignments, settings });
+    const hoursCheck = validateMaxHoursPerWeek({
+        staffId: staff._id || staff.id,
+        assignments: [...assignments, { staffId: staff._id || staff.id, date, shiftType }],
+        settings,
+        schedule,
+    });
     if (hoursCheck.warning) warnings.push(hoursCheck.warning);
 
     return { valid: errors.length === 0, errors, warnings };
@@ -217,13 +300,13 @@ export function validateFullSchedule({ staff, assignments, settings, schedule })
         const id = String(sm._id || sm.id);
         const own = assignments.filter((a) => String(a.staffId) === id);
         if (!own.length) return;
-        const r = validateMaxHoursPerWeek({ staffId: id, assignments, settings });
+        const r = validateMaxHoursPerWeek({ staffId: id, assignments, settings, schedule });
         if (r.warning) warnings.push({ type: 'max_hours', staffId: id, staffName: staffDisplayName(sm), message: r.warning, severity: 'warning' });
         if (schedule?.startDate && schedule?.endDate && sm.wardRole === 'regular') {
             const start = new Date(schedule.startDate);
             const end = new Date(schedule.endDate);
             const totalDays = Math.floor((end - start) / (24 * 3600 * 1000)) + 1;
-            const targetOffDays = Math.min(totalDays, 12 + holidayKeys(schedule).size);
+            const targetOffDays = scaledOffDayTarget(totalDays, holidayKeys(schedule).size);
             const workedDays = new Set(own.map((a) => dateKey(a.date))).size;
             const offDays = totalDays - workedDays;
             if (offDays < targetOffDays) {

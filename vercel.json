@@ -11,11 +11,5 @@
       "src": "/(.*)",
       "dest": "src/index.js"
     }
-  ],
-  "env": {
-    "FIREBASE_ADMIN_PROJECT_ID": "@firebase_admin_project_id",
-    "FIREBASE_ADMIN_CLIENT_EMAIL": "@firebase_admin_client_email",
-    "FIREBASE_ADMIN_PRIVATE_KEY": "@firebase_admin_private_key",
-    "ALLOWED_ORIGINS": "@allowed_origins"
-  }
+  ]
 }

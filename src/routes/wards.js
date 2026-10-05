@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { db } from '../config/firebase.js';
-import { requireAuth, requireHospital } from '../middleware/auth.js';
+import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
 import { logDataModification, logError } from '../lib/logger.js';
 
 const router = Router({ mergeParams: true });
@@ -23,7 +23,7 @@ router.get('/', requireAuth, requireHospital, async (req, res) => {
 });
 
 // POST /hospitals/:id/wards
-router.post('/', requireAuth, requireHospital, async (req, res) => {
+router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId } = req.params;
         const name = String(req.body.name || '').trim();
@@ -59,7 +59,7 @@ router.post('/', requireAuth, requireHospital, async (req, res) => {
 });
 
 // PATCH /hospitals/:id/wards/:wardId
-router.patch('/:wardId', requireAuth, requireHospital, async (req, res) => {
+router.patch('/:wardId', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, wardId } = req.params;
         const ref = db.doc(`hospitals/${hospitalId}/wards/${wardId}`);
@@ -85,7 +85,7 @@ router.patch('/:wardId', requireAuth, requireHospital, async (req, res) => {
 });
 
 // DELETE /hospitals/:id/wards/:wardId
-router.delete('/:wardId', requireAuth, requireHospital, async (req, res) => {
+router.delete('/:wardId', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, wardId } = req.params;
 

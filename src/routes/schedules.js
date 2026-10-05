@@ -1,6 +1,6 @@
 import { Router } from 'express';
-import { db } from '../config/firebase.js';
-import { requireAuth, requireHospital } from '../middleware/auth.js';
+import { db, batchedDelete } from '../config/firebase.js';
+import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
 import { validateAssignment } from '../lib/validation.js';
 import { logDataModification, logValidationFailure, logError } from '../lib/logger.js';
 
@@ -121,7 +121,7 @@ router.get('/:schedId', requireAuth, requireHospital, async (req, res) => {
 });
 
 // POST /hospitals/:id/schedules
-router.post('/', requireAuth, requireHospital, async (req, res) => {
+router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId } = req.params;
         const hospitalSnap = await db.doc(`hospitals/${hospitalId}`).get();
@@ -174,7 +174,7 @@ router.post('/', requireAuth, requireHospital, async (req, res) => {
 });
 
 // PATCH /hospitals/:id/schedules/:schedId
-router.patch('/:schedId', requireAuth, requireHospital, async (req, res) => {
+router.patch('/:schedId', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, schedId } = req.params;
         const ref = db.doc(`hospitals/${hospitalId}/schedules/${schedId}`);
@@ -202,20 +202,15 @@ router.patch('/:schedId', requireAuth, requireHospital, async (req, res) => {
 });
 
 // DELETE /hospitals/:id/schedules/:schedId
-router.delete('/:schedId', requireAuth, requireHospital, async (req, res) => {
+router.delete('/:schedId', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, schedId } = req.params;
         const ref = db.doc(`hospitals/${hospitalId}/schedules/${schedId}`);
         const snap = await ref.get();
         if (!snap.exists) return res.status(404).json({ error: 'Schedule not found' });
 
-        // Delete all assignments
         const assignSnap = await ref.collection('assignments').get();
-        if (assignSnap.size > 0) {
-            const batch = db.batch();
-            assignSnap.docs.forEach((d) => batch.delete(d.ref));
-            await batch.commit();
-        }
+        await batchedDelete(assignSnap.docs.map((d) => d.ref));
         await ref.delete();
 
         logDataModification('DELETE', 'schedule', schedId, { removedAssignments: assignSnap.size });
@@ -229,7 +224,7 @@ router.delete('/:schedId', requireAuth, requireHospital, async (req, res) => {
 // ── Assignments sub-resource ─────────────────────────────────────────────────
 
 // POST /hospitals/:id/schedules/:schedId/assignments
-router.post('/:schedId/assignments', requireAuth, requireHospital, async (req, res) => {
+router.post('/:schedId/assignments', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, schedId } = req.params;
         const { staffId, date, shiftTypeId } = req.body;
@@ -332,18 +327,14 @@ router.post('/:schedId/assignments', requireAuth, requireHospital, async (req, r
 });
 
 // DELETE /hospitals/:id/schedules/:schedId/assignments?clearAll=true|staffId=...&date=...
-router.delete('/:schedId/assignments', requireAuth, requireHospital, async (req, res) => {
+router.delete('/:schedId/assignments', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
         const { id: hospitalId, schedId } = req.params;
         const assignColl = db.collection(`hospitals/${hospitalId}/schedules/${schedId}/assignments`);
 
         if (req.query.clearAll === 'true') {
             const snap = await assignColl.get();
-            if (snap.size > 0) {
-                const batch = db.batch();
-                snap.docs.forEach((d) => batch.delete(d.ref));
-                await batch.commit();
-            }
+            await batchedDelete(snap.docs.map((d) => d.ref));
             logDataModification('CLEAR', 'assignments', schedId, { count: snap.size });
             return res.json({ success: true, removed: snap.size });
         }

@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "vercel-build": "echo 'No build step required for Express serverless'"
   },
   "dependencies": {
     "cors": "^2.8.5",
