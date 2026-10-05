@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import { db, batchedDelete, batchedSet } from '../config/firebase.js';
 import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
-import { classifyStaffType } from '../lib/staff-utils.js';
+import { classifyStaffType, compareStaffName } from '../lib/staff-utils.js';
 import { buildStaffCsvTemplate, mapCsvRowToStaff, parseCsv } from '../lib/staff-csv.js';
 import { categoryFromRank, expandRank, splitFullName } from '../lib/rank-abbr.js';
 import { extractRosterPreview } from '../lib/roster-ingest.js';
@@ -50,17 +50,21 @@ router.get('/', requireAuth, requireHospital, async (req, res) => {
         const { id: hospitalId } = req.params;
         const { departmentId, wardId } = req.query;
 
-        let query = db.collection(`hospitals/${hospitalId}/staff`).orderBy('lastName').orderBy('firstName');
-        if (departmentId) query = query.where('departmentId', '==', departmentId);
-        if (wardId) query = query.where('wardId', '==', wardId);
-
         const [staffSnap, wardSnap] = await Promise.all([
-            query.get(),
+            db.collection(`hospitals/${hospitalId}/staff`).get(),
             db.collection(`hospitals/${hospitalId}/wards`).get(),
         ]);
 
         const wardsMap = new Map(wardSnap.docs.map((w) => [w.data().departmentId, w.id]));
-        return res.json(staffSnap.docs.map((d) => serializeStaff(d.id, d.data(), wardsMap)));
+        const staff = staffSnap.docs
+            .map((d) => serializeStaff(d.id, d.data(), wardsMap))
+            .filter((s) => {
+                if (departmentId && String(s.departmentId) !== String(departmentId)) return false;
+                if (wardId && String(s.wardId) !== String(wardId)) return false;
+                return true;
+            })
+            .sort(compareStaffName);
+        return res.json(staff);
     } catch (err) {
         logError('STAFF_API', 'Failed to list staff', err);
         return res.status(500).json({ error: err.message });

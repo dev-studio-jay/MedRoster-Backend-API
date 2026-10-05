@@ -28,6 +28,12 @@ export function staffDisplayName(staff) {
     return `${staff.firstName || ''} ${staff.lastName || ''}`.trim() || 'Unknown';
 }
 
+export function compareStaffName(a, b) {
+    const last = String(a.lastName || '').localeCompare(String(b.lastName || ''), undefined, { sensitivity: 'base' });
+    if (last !== 0) return last;
+    return String(a.firstName || '').localeCompare(String(b.firstName || ''), undefined, { sensitivity: 'base' });
+}
+
 export function isStaffOnLeave(staff, date) {
     if (!staff?.leaveRecords?.length) return false;
     const check = new Date(date);

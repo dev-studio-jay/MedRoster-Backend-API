@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db, batchedDelete } from '../config/firebase.js';
 import { requireAuth, requireHospital, requireWriteAccess } from '../middleware/auth.js';
+import { compareStaffName } from '../lib/staff-utils.js';
 import { validateAssignment } from '../lib/validation.js';
 import { logDataModification, logValidationFailure, logError } from '../lib/logger.js';
 
@@ -89,17 +90,20 @@ router.get('/:schedId', requireAuth, requireHospital, async (req, res) => {
         else if (scheduleDepartmentId) staffQuery = staffQuery.where('departmentId', '==', scheduleDepartmentId);
 
         const [staffSnap, assignSnap] = await Promise.all([
-            staffQuery.orderBy('lastName').orderBy('firstName').get(),
+            staffQuery.get(),
             db.collection(`hospitals/${hospitalId}/schedules/${schedId}/assignments`).get(),
         ]);
 
         const hospitalData = { _id: hospitalSnap.id, ...hospitalSnap.data() };
-        const staff = staffSnap.docs.map((s) => ({
-            _id: s.id,
-            ...s.data(),
-            wardId: s.data().wardId || scheduleWardId || '',
-            fullName: `${s.data().firstName} ${s.data().lastName}`.trim(),
-        }));
+        const staff = staffSnap.docs.map((s) => {
+            const data = s.data();
+            return {
+                _id: s.id,
+                ...data,
+                wardId: data.wardId || scheduleWardId || '',
+                fullName: `${data.firstName || ''} ${data.lastName || ''}`.trim(),
+            };
+        }).sort(compareStaffName);
         const assignments = assignSnap.docs.map((a) => ({ _id: a.id, ...a.data() }));
 
         return res.json({
