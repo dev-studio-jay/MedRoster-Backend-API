@@ -2,6 +2,8 @@
 
 See the full guide: [../VERCEL_SETUP.md](../VERCEL_SETUP.md)
 
+**Production:** [https://medroster-backend.vercel.app](https://medroster-backend.vercel.app) — Vercel team `dev-studio-jay`, project `medroster-backend`.
+
 ## Quick deploy
 
 ```bash
