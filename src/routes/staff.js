@@ -290,6 +290,75 @@ async function upsertSlimStaff({ hospitalId, departmentId, wardId, row, now }) {
     return ref.id;
 }
 
+function cellToken(cell) {
+    return String(cell?.code || cell?.text || '').toUpperCase().replace(/\s+/g, '');
+}
+
+function isLeaveCell(cell) {
+    const token = cellToken(cell);
+    return token === 'L' || token === 'LV' || token.includes('LEAVE');
+}
+
+function isOffOrHolidayCell(cell) {
+    const token = cellToken(cell);
+    return token === 'O' || token === 'H' || token === 'OFF' || token === 'D/O' || token === 'N/O' || token === 'H/O';
+}
+
+function nextDateKey(dateKey) {
+    const d = new Date(`${dateKey}T00:00:00.000Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().split('T')[0];
+}
+
+function leaveRunsFromRow(row) {
+    const dates = [...new Set((row.cells || []).filter((c) => c.date && isLeaveCell(c)).map((c) => c.date))].sort();
+    const runs = [];
+    let start = null;
+    let prev = null;
+    const flush = () => {
+        if (!start) return;
+        runs.push({
+            id: randomUUID(),
+            startDate: `${start}T00:00:00.000Z`,
+            endDate: `${prev}T23:59:59.000Z`,
+            leaveType: row.leaveType || 'Leave',
+            status: 'Approved',
+            notes: row.leaveNote || '',
+        });
+        start = null;
+        prev = null;
+    };
+    for (const date of dates) {
+        if (!start) {
+            start = date;
+            prev = date;
+            continue;
+        }
+        if (date === nextDateKey(prev)) {
+            prev = date;
+            continue;
+        }
+        flush();
+        start = date;
+        prev = date;
+    }
+    flush();
+    return runs;
+}
+
+function dateKeysInLeaveRuns(runs) {
+    const keys = new Set();
+    for (const run of runs) {
+        let cursor = run.startDate.split('T')[0];
+        const end = run.endDate.split('T')[0];
+        while (cursor <= end) {
+            keys.add(cursor);
+            cursor = nextDateKey(cursor);
+        }
+    }
+    return keys;
+}
+
 // POST /hospitals/:id/staff/import-roster — confirm extract into staff + draft schedule
 router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, async (req, res) => {
     try {
@@ -300,7 +369,13 @@ router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, 
             defaultDepartmentId,
             defaultWardId,
             createSchedule = true,
+            rules: importRules = {},
         } = req.body;
+        const rules = {
+            leaveStayOff: importRules.leaveStayOff !== false,
+            offAndHolidayStayOff: importRules.offAndHolidayStayOff !== false,
+            keepGridAsIs: importRules.keepGridAsIs !== false,
+        };
 
         if (!defaultDepartmentId || !defaultWardId) {
             return res.status(400).json({ error: 'Department and ward are required' });
@@ -329,6 +404,7 @@ router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, 
         }
 
         const now = new Date().toISOString();
+
         let dateList = (days.length ? days : []).map((d) => d.date).filter(Boolean).sort();
         if (dateList.length > 31) dateList = dateList.slice(0, 31);
         const startDate = dateList[0];
@@ -341,17 +417,7 @@ router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, 
             const ranks = expandRank(row.rankFull || row.rank || row.rankAbbr);
             const nameKey = `${names.firstName} ${names.lastName}`.trim().toLowerCase();
             const existing = byName.get(nameKey);
-            const leaveRecords = [];
-            if (row.leaveType && startDate && endDate) {
-                leaveRecords.push({
-                    id: randomUUID(),
-                    startDate: `${startDate}T00:00:00.000Z`,
-                    endDate: `${endDate}T23:59:59.000Z`,
-                    leaveType: row.leaveType,
-                    status: 'Approved',
-                    notes: row.leaveNote || '',
-                });
-            }
+            const leaveRecords = rules.leaveStayOff ? leaveRunsFromRow(row) : [];
             const id = await upsertSlimStaff({
                 hospitalId,
                 departmentId: defaultDepartmentId,
@@ -362,31 +428,40 @@ router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, 
                     firstName: names.firstName,
                     lastName: names.lastName,
                     rankFull: ranks.rankFull || row.rank,
+                    rank: ranks.rankFull || row.rank,
                     existingId: existing?.id,
                     leaveRecords: existing ? undefined : leaveRecords,
                 },
             });
             if (existing && leaveRecords.length) {
                 const prev = existing.data().leaveRecords || [];
+                const merged = [...prev];
+                for (const run of leaveRecords) {
+                    const already = prev.some((p) => p.startDate === run.startDate && p.endDate === run.endDate);
+                    if (!already) merged.push(run);
+                }
                 await db.doc(`hospitals/${hospitalId}/staff/${id}`).update({
-                    leaveRecords: [...prev, ...leaveRecords],
+                    leaveRecords: merged,
                 });
             }
-            staffIds.push({ row, id });
+            staffIds.push({ row, id, leaveRecords });
         }
 
         let scheduleId = null;
         let assignmentCount = 0;
-        if (createSchedule && startDate && endDate) {
+        const writeSchedule = (createSchedule || rules.keepGridAsIs) && startDate && endDate;
+        if (writeSchedule) {
             const start = new Date(`${startDate}T00:00:00.000Z`);
             const end = new Date(`${endDate}T00:00:00.000Z`);
             const holidays = [];
             const holidayDates = new Set();
-            for (const { row } of staffIds) {
-                for (const cell of row.cells || []) {
-                    if (String(cell.code).toUpperCase() === 'H' && cell.date && inRange.has(cell.date) && !holidayDates.has(cell.date)) {
-                        holidayDates.add(cell.date);
-                        holidays.push({ date: `${cell.date}T00:00:00.000Z`, name: 'Holiday' });
+            if (rules.offAndHolidayStayOff) {
+                for (const { row } of staffIds) {
+                    for (const cell of row.cells || []) {
+                        if (cellToken(cell) === 'H' && cell.date && inRange.has(cell.date) && !holidayDates.has(cell.date)) {
+                            holidayDates.add(cell.date);
+                            holidays.push({ date: `${cell.date}T00:00:00.000Z`, name: 'Holiday' });
+                        }
                     }
                 }
             }
@@ -398,6 +473,11 @@ router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, 
             let schedRef;
             if (!dupSnap.empty) {
                 schedRef = dupSnap.docs[0].ref;
+                const existingAssign = await schedRef.collection('assignments').get();
+                if (!existingAssign.empty) {
+                    await batchedDelete(existingAssign.docs.map((d) => d.ref));
+                }
+                await schedRef.update({ holidays, updatedAt: now, name: req.body.title || dupSnap.docs[0].data().name });
             } else {
                 schedRef = db.collection(`hospitals/${hospitalId}/schedules`).doc();
                 await schedRef.set({
@@ -416,28 +496,34 @@ router.post('/import-roster', requireAuth, requireHospital, requireWriteAccess, 
             }
             scheduleId = schedRef.id;
 
-            const shiftTypes = hospitalSnap.data().shiftTypes || [];
-            const assignDocs = [];
-            for (const { row, id } of staffIds) {
-                for (const a of row.assignments || []) {
-                    if (!inRange.has(a.date)) continue;
-                    const shift = shiftFromCode(shiftTypes, a.code);
-                    if (!shift) continue;
-                    assignDocs.push({
-                        scheduleId,
-                        hospitalId,
-                        staffId: id,
-                        departmentId: defaultDepartmentId,
-                        wardId: defaultWardId,
-                        date: `${a.date}T00:00:00.000Z`,
-                        shiftType: { name: shift.name, color: shift.color, startTime: shift.startTime, endTime: shift.endTime },
-                        createdAt: now,
-                    });
+            if (rules.keepGridAsIs) {
+                const shiftTypes = hospitalSnap.data().shiftTypes || [];
+                const assignDocs = [];
+                for (const { row, id, leaveRecords } of staffIds) {
+                    const leaveDates = dateKeysInLeaveRuns(leaveRecords || []);
+                    for (const a of row.assignments || []) {
+                        if (!inRange.has(a.date)) continue;
+                        if (rules.leaveStayOff && leaveDates.has(a.date)) continue;
+                        const cell = (row.cells || []).find((c) => c.date === a.date);
+                        if (rules.offAndHolidayStayOff && (isOffOrHolidayCell(cell) || isLeaveCell(cell))) continue;
+                        const shift = shiftFromCode(shiftTypes, a.code);
+                        if (!shift) continue;
+                        assignDocs.push({
+                            scheduleId,
+                            hospitalId,
+                            staffId: id,
+                            departmentId: defaultDepartmentId,
+                            wardId: defaultWardId,
+                            date: `${a.date}T00:00:00.000Z`,
+                            shiftType: { name: shift.name, color: shift.color, startTime: shift.startTime, endTime: shift.endTime },
+                            createdAt: now,
+                        });
+                    }
                 }
-            }
-            if (assignDocs.length) {
-                await batchedSet(schedRef.collection('assignments'), assignDocs);
-                assignmentCount = assignDocs.length;
+                if (assignDocs.length) {
+                    await batchedSet(schedRef.collection('assignments'), assignDocs);
+                    assignmentCount = assignDocs.length;
+                }
             }
         }
 

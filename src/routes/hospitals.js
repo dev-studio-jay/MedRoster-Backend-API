@@ -121,6 +121,20 @@ router.patch('/:id', requireAuth, requireHospital, requireWriteAccess, async (re
         for (const key of allowed) {
             if (req.body[key] !== undefined) update[key] = req.body[key];
         }
+        if (update.settings && typeof update.settings === 'object') {
+            const incoming = update.settings;
+            const vr = incoming.validationRules || {};
+            update.settings = {
+                ...incoming,
+                minSeniorStaffPerDay: Math.max(1, incoming.minSeniorStaffPerDay ?? 1),
+                validationRules: {
+                    ...vr,
+                    enforceLeaveConflicts: true,
+                    enforceRoleShiftRestrictions: true,
+                    enforceSupervisoryCoverage: true,
+                },
+            };
+        }
 
         const ref = db.doc(`hospitals/${hospitalId}`);
         const snap = await ref.get();

@@ -105,7 +105,7 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
 
         const shiftTypes = hospitalData.shiftTypes || [];
         const settings = hospitalData.settings || {};
-        const minSenior = settings.minSeniorStaffPerDay ?? 1;
+        const minSenior = Math.max(1, settings.minSeniorStaffPerDay ?? 1);
         const maxConsecutive = settings.maxConsecutiveDays ?? 6;
         const maxNights = settings.maxConsecutiveNights ?? 3;
         const maxHoursPerWeek = settings.maxHoursPerWeek ?? 48;
@@ -133,7 +133,7 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
             allStaff
                 .filter((s) => {
                     const t = s.staffType || classifyStaffType(s.rank);
-                    return t === 'senior' || t === 'pno';
+                    return t === 'senior' || t === 'pno' || s.wardRole === 'incharge';
                 })
                 .map((s) => s._id)
         );
@@ -150,11 +150,17 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
             const assignedToday = new Set();
             const seniorAssignedToday = new Set();
             const filledShiftsToday = [];
+            const orderedShifts = [...shiftTypes].sort((a, b) => {
+                if (a.name === 'Morning' && b.name !== 'Morning') return -1;
+                if (b.name === 'Morning' && a.name !== 'Morning') return 1;
+                return 0;
+            });
 
-            for (const shift of shiftTypes) {
+            for (const shift of orderedShifts) {
                 if (filledShiftsToday.some((filled) => shiftsOverlap(filled, shift))) continue;
 
                 const isNight = shift.name === 'Night';
+                const isMorning = shift.name === 'Morning';
                 const shiftHours = shiftDurationHours(shift);
 
                 const pool = allStaff.filter((s) => {
@@ -187,7 +193,7 @@ router.post('/', requireAuth, requireHospital, requireWriteAccess, async (req, r
                 });
 
                 let pick = pool[0];
-                if (!isNight && seniorAssignedToday.size < minSenior) {
+                if (isMorning && seniorAssignedToday.size < minSenior) {
                     const seniorPick = pool.find((s) => seniorIds.has(s._id));
                     if (seniorPick) pick = seniorPick;
                 }
